@@ -98,3 +98,411 @@ def setup_db():
                 unit_price NUMERIC NOT NULL,
                 unit_cost NUMERIC NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """
+        )
+        count = conn.execute("SELECT COUNT(*) AS count FROM products").fetchone()["count"]
+        if count == 0 and SEED_PATH.exists():
+            with SEED_PATH.open("r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                now = datetime.now().isoformat(timespec="seconds")
+                for row in reader:
+                    conn.execute(
+                        """
+                        INSERT INTO products (sku, name, style, unit, cost, price, active, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s)
+                        ON CONFLICT (sku) DO NOTHING
+                        """,
+                        (
+                            row["sku"],
+                            row["name"],
+                            row.get("style") or "",
+                            row.get("unit") or "個",
+                            float(row.get("cost") or 0),
+                            float(row.get("price") or 0),
+                            now,
+                        ),
+                    )
+        conn.commit()
+
+
+def require_auth(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if session.get("authenticated"):
+            return fn(*args, **kwargs)
+        if request.path.startswith("/api/") or request.path.startswith("/export/"):
+            return jsonify({"error": "請先登入"}), 401
+        return redirect(url_for("login"))
+
+    return wrapper
+
+
+def rows_to_json(rows):
+    return [{key: float(value) if hasattr(value, "as_tuple") else value for key, value in row.items()} for row in rows]
+
+
+@app.before_request
+def init_once():
+    if not getattr(app, "_db_ready", False):
+        setup_db()
+        app._db_ready = True
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return Response(status=204)
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = ""
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        if secrets.compare_digest(username, APP_USERNAME) and secrets.compare_digest(password, APP_PASSWORD):
+            session["authenticated"] = True
+            return redirect(url_for("index"))
+        error = '<div class="error">帳號或密碼錯誤</div>'
+    return Response(LOGIN_HTML.format(error=error), mimetype="text/html; charset=utf-8")
+
+
+@app.get("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.get("/")
+@require_auth
+def index():
+    html = HTML.replace("資料庫：data/inventory.sqlite3", "線上共用版")
+    return Response(html, mimetype="text/html; charset=utf-8")
+
+
+@app.get("/api/products")
+@require_auth
+def api_products():
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, sku, name, style, unit, cost, price, active, 0 AS stock
+            FROM products
+            WHERE active = TRUE
+            ORDER BY name COLLATE "C", style COLLATE "C", sku COLLATE "C"
+            """
+        ).fetchall()
+    return jsonify(rows_to_json(rows))
+
+
+@app.post("/api/product")
+@require_auth
+def api_product():
+    data = request.get_json(force=True)
+    sku = (data.get("sku") or "").strip()
+    name = (data.get("name") or "").strip()
+    if not sku or not name:
+        return jsonify({"error": "請輸入商品編號與名稱"}), 400
+    with db() as conn:
+        if data.get("id"):
+            conn.execute(
+                """
+                UPDATE products
+                SET sku=%s, name=%s, style=%s, unit=%s, cost=%s, price=%s
+                WHERE id=%s
+                """,
+                (
+                    sku,
+                    name,
+                    (data.get("style") or "").strip(),
+                    data.get("unit") or "個",
+                    float(data.get("cost") or 0),
+                    float(data.get("price") or 0),
+                    int(data["id"]),
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO products (sku, name, style, unit, cost, price, active, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s)
+                """,
+                (
+                    sku,
+                    name,
+                    (data.get("style") or "").strip(),
+                    data.get("unit") or "個",
+                    float(data.get("cost") or 0),
+                    float(data.get("price") or 0),
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+        conn.commit()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/product/deactivate")
+@require_auth
+def api_product_deactivate():
+    data = request.get_json(force=True)
+    with db() as conn:
+        conn.execute("UPDATE products SET active=FALSE WHERE id=%s", (int(data["id"]),))
+        conn.commit()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/product/delete")
+@require_auth
+def api_product_delete():
+    data = request.get_json(force=True)
+    product_id = int(data["id"])
+    with db() as conn:
+        count = conn.execute("SELECT COUNT(*) AS count FROM sale_items WHERE product_id=%s", (product_id,)).fetchone()["count"]
+        if count:
+            conn.execute("UPDATE products SET active=FALSE WHERE id=%s", (product_id,))
+        else:
+            conn.execute("DELETE FROM products WHERE id=%s", (product_id,))
+        conn.commit()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/sales")
+@require_auth
+def api_sales():
+    with db() as conn:
+        sale_rows = rows_to_json(
+            conn.execute(
+                """
+                SELECT *
+                FROM sales
+                ORDER BY sold_on DESC, id DESC
+                LIMIT 200
+                """
+            ).fetchall()
+        )
+        for sale in sale_rows:
+            sale["items"] = rows_to_json(
+                conn.execute(
+                    """
+                    SELECT product_name, product_style, qty, unit_price
+                    FROM sale_items
+                    WHERE sale_id=%s
+                    ORDER BY id
+                    """,
+                    (sale["id"],),
+                ).fetchall()
+            )
+    return jsonify(sale_rows)
+
+
+@app.post("/api/sale")
+@require_auth
+def api_sale():
+    data = request.get_json(force=True)
+    items = data.get("items") or []
+    if not items:
+        return jsonify({"error": "請先加入購買商品"}), 400
+    sold_on = data.get("sold_on") or date.today().isoformat()
+    datetime.strptime(sold_on, "%Y-%m-%d")
+    donation = float(data.get("donation") or 0)
+    if donation < 0:
+        return jsonify({"error": "捐款金額不可小於 0"}), 400
+
+    with db() as conn:
+        product_ids = [int(item["product_id"]) for item in items]
+        placeholders = ", ".join(["%s"] * len(product_ids))
+        product_rows = {
+            row["id"]: row
+            for row in conn.execute(
+                f"SELECT * FROM products WHERE id IN ({placeholders})",
+                tuple(product_ids),
+            ).fetchall()
+        }
+
+        item_total = 0
+        total_qty = 0
+        clean_items = []
+        for item in items:
+            product_id = int(item["product_id"])
+            product = product_rows.get(product_id)
+            if not product:
+                return jsonify({"error": "找不到商品"}), 400
+            qty = float(item.get("qty") or 0)
+            unit_price = float(item.get("unit_price") or 0)
+            if qty <= 0:
+                return jsonify({"error": "商品數量要大於 0"}), 400
+            item_total += qty * unit_price
+            total_qty += qty
+            clean_items.append((product, qty, unit_price))
+
+        now = datetime.now().isoformat(timespec="seconds")
+        sale = conn.execute(
+            """
+            INSERT INTO sales (event_name, collector, line_pay, donation, sold_on, total_items, total_amount, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                (data.get("event_name") or "").strip(),
+                (data.get("collector") or "").strip(),
+                str(data.get("line_pay")) == "1",
+                donation,
+                sold_on,
+                total_qty,
+                item_total + donation,
+                now,
+            ),
+        ).fetchone()
+        sale_id = sale["id"]
+        for product, qty, unit_price in clean_items:
+            conn.execute(
+                """
+                INSERT INTO sale_items (sale_id, product_id, product_name, product_style, qty, unit_price, unit_cost)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (sale_id, product["id"], product["name"], product["style"], qty, unit_price, product["cost"]),
+            )
+        conn.commit()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/sale/delete")
+@require_auth
+def api_sale_delete():
+    data = request.get_json(force=True)
+    with db() as conn:
+        conn.execute("DELETE FROM sales WHERE id=%s", (int(data["id"]),))
+        conn.commit()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/collectors")
+@require_auth
+def api_collectors():
+    with db() as conn:
+        cleared_at = conn.execute("SELECT value FROM app_settings WHERE key='collectors_cleared_at'").fetchone()
+        params = ()
+        filter_sql = ""
+        if cleared_at:
+            filter_sql = "AND created_at > %s"
+            params = (cleared_at["value"],)
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT collector
+            FROM sales
+            WHERE TRIM(collector) != ''
+            {filter_sql}
+            ORDER BY collector COLLATE "C"
+            """,
+            params,
+        ).fetchall()
+    return jsonify([row["collector"] for row in rows])
+
+
+@app.post("/api/collectors/clear")
+@require_auth
+def api_collectors_clear():
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value)
+            VALUES ('collectors_cleared_at', %s)
+            ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+            """,
+            (datetime.now().isoformat(timespec="seconds"),),
+        )
+        conn.commit()
+    return jsonify({"ok": True})
+
+
+def daily_summary(day):
+    with db() as conn:
+        totals = conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(total_amount - donation), 0) AS sales_amount,
+                COALESCE(SUM(donation), 0) AS donation_amount,
+                COALESCE(SUM(total_amount), 0) AS total_received,
+                COALESCE(SUM(CASE WHEN line_pay = TRUE THEN total_amount ELSE 0 END), 0) AS line_pay_amount,
+                COALESCE(SUM(CASE WHEN line_pay = FALSE THEN total_amount ELSE 0 END), 0) AS cash_amount
+            FROM sales
+            WHERE sold_on=%s
+            """,
+            (day,),
+        ).fetchone()
+        event_rows = conn.execute(
+            """
+            SELECT DISTINCT event_name
+            FROM sales
+            WHERE sold_on=%s AND TRIM(event_name) != ''
+            ORDER BY event_name COLLATE "C"
+            """,
+            (day,),
+        ).fetchall()
+        rows = conn.execute(
+            """
+            SELECT
+                si.product_name AS name,
+                si.product_style AS style,
+                COALESCE(SUM(si.qty), 0) AS sale_qty,
+                COALESCE(SUM(si.qty * si.unit_price), 0) AS sales_amount
+            FROM sale_items si
+            JOIN sales s ON s.id = si.sale_id
+            WHERE s.sold_on=%s
+            GROUP BY si.product_name, si.product_style
+            ORDER BY si.product_name COLLATE "C", si.product_style COLLATE "C"
+            """,
+            (day,),
+        ).fetchall()
+    result = {key: float(value) for key, value in totals.items()}
+    result["events"] = "、".join(row["event_name"] for row in event_rows)
+    return {"totals": result, "rows": rows_to_json(rows)}
+
+
+@app.get("/api/summary")
+@require_auth
+def api_summary():
+    day = request.args.get("day") or date.today().isoformat()
+    return jsonify(daily_summary(day))
+
+
+@app.get("/export/summary")
+@require_auth
+def export_summary():
+    day = request.args.get("day") or date.today().isoformat()
+    summary = daily_summary(day)
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["日期", day])
+    writer.writerow(["活動", summary["totals"]["events"]])
+    writer.writerow(
+        [
+            "商品銷售",
+            summary["totals"]["sales_amount"],
+            "捐款",
+            summary["totals"]["donation_amount"],
+            "總收入",
+            summary["totals"]["total_received"],
+            "LINE Pay",
+            summary["totals"]["line_pay_amount"],
+            "現金",
+            summary["totals"]["cash_amount"],
+        ]
+    )
+    writer.writerow([])
+    writer.writerow(["商品名稱", "款式", "售出數量", "銷售金額"])
+    for row in summary["rows"]:
+        writer.writerow([row["name"], row["style"], row["sale_qty"], row["sales_amount"]])
+    return Response(
+        out.getvalue().encode("utf-8-sig"),
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="daily_summary_{day}.csv"'},
+    )
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
