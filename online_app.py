@@ -168,7 +168,7 @@ def login():
             session["authenticated"] = True
             return redirect(url_for("index"))
         error = '<div class="error">帳號或密碼錯誤</div>'
-    return Response(LOGIN_HTML.format(error=error), mimetype="text/html; charset=utf-8")
+    return Response(LOGIN_HTML.replace("{error}", error), mimetype="text/html; charset=utf-8")
 
 
 @app.get("/logout")
