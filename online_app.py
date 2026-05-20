@@ -403,7 +403,7 @@ def api_collectors():
             FROM sales
             WHERE TRIM(collector) != ''
             {filter_sql}
-            ORDER BY collector COLLATE "C"
+            ORDER BY collector
             """,
             params,
         ).fetchall()
@@ -446,7 +446,7 @@ def daily_summary(day):
             SELECT DISTINCT event_name
             FROM sales
             WHERE sold_on=%s AND TRIM(event_name) != ''
-            ORDER BY event_name COLLATE "C"
+            ORDER BY event_name
             """,
             (day,),
         ).fetchall()
