@@ -407,9 +407,17 @@ HTML = r"""<!doctype html>
     const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const label = p => `${p.name}${p.style ? ' - ' + p.style : ''}`;
     async function api(path, data) {
-      const opt = data ? {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)} : {};
+      const opt = data
+        ? {method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)}
+        : {credentials:'same-origin'};
       const res = await fetch(path, opt);
-      const out = await res.json();
+      const text = await res.text();
+      let out;
+      try {
+        out = JSON.parse(text);
+      } catch (err) {
+        throw new Error(`讀取資料失敗：伺服器回傳了網頁錯誤頁（HTTP ${res.status}）。請到 Render 的 Logs 看紅色錯誤。`);
+      }
       if (!res.ok || out.error) throw new Error(out.error || '操作失敗');
       return out;
     }
