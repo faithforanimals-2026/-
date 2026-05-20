@@ -153,6 +153,13 @@ def init_once():
         app._db_ready = True
 
 
+@app.errorhandler(Exception)
+def handle_error(exc):
+    if request.path.startswith("/api/") or request.path.startswith("/export/"):
+        return jsonify({"error": str(exc)}), 500
+    raise exc
+
+
 @app.get("/favicon.ico")
 def favicon():
     return Response(status=204)
