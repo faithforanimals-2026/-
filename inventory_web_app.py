@@ -390,18 +390,21 @@ HTML = r"""<!doctype html>
         <div class="metric"><span>LINE Pay</span><strong id="tLine">0</strong></div>
         <div class="metric"><span>現金</span><strong id="tCash">0</strong></div>
       </div>
+      <div class="table-wrap"><table><thead><tr><th>日期</th><th>活動</th><th>收款人</th><th>付款方式</th><th>內容</th><th class="right">商品總價</th><th class="right">捐款</th><th class="right">總金額</th></tr></thead><tbody id="summarySaleRows"></tbody></table></div>
       <div class="table-wrap"><table><thead><tr><th>商品</th><th>款式</th><th class="right">售出數量</th><th class="right">銷售金額</th></tr></thead><tbody id="summaryRows"></tbody></table></div>
     </section>
   </main>
   <script>
     let productData = [];
     let saleLines = [];
+    let summaryLoaded = false;
     const q = id => document.getElementById(id);
     const today = new Date().toISOString().slice(0, 10);
     q('saleDate').value = today; q('sDate').value = today;
     document.querySelectorAll('.tab').forEach(btn => btn.addEventListener('click', () => {
       document.querySelectorAll('.tab,.view').forEach(el => el.classList.remove('active'));
       btn.classList.add('active'); document.querySelector('#' + btn.dataset.view).classList.add('active');
+      if (btn.dataset.view === 'summary' && !summaryLoaded) loadSummary();
     }));
     const fmt = n => Number(n || 0).toLocaleString('zh-TW', { maximumFractionDigits: 2 });
     const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -423,11 +426,12 @@ HTML = r"""<!doctype html>
     }
     async function loadAll() {
       try {
-        productData = await api('/api/products');
+        const data = await api('/api/bootstrap');
+        productData = data.products || [];
         renderProducts(); renderProductOptions();
-        renderSales(await api('/api/sales'));
-        renderCollectors(await api('/api/collectors'));
-        await loadSummary();
+        renderSales(data.sales || []);
+        renderCollectors(data.collectors || []);
+        if (document.querySelector('#summary').classList.contains('active')) await loadSummary();
       } catch (err) {
         alert(err.message);
       }
@@ -553,12 +557,14 @@ HTML = r"""<!doctype html>
     }
     async function loadSummary() {
       const out = await api('/api/summary?day=' + encodeURIComponent(q('sDate').value));
+      summaryLoaded = true;
       q('tSales').textContent = fmt(out.totals.sales_amount);
       q('tDonation').textContent = fmt(out.totals.donation_amount);
       q('tReceived').textContent = fmt(out.totals.total_received);
       q('tLine').textContent = fmt(out.totals.line_pay_amount);
       q('tCash').textContent = fmt(out.totals.cash_amount);
       q('summaryEvents').textContent = out.totals.events || '尚無活動名稱';
+      q('summarySaleRows').innerHTML = out.sales.map(s => `<tr><td>${s.sold_on}</td><td>${esc(s.event_name || '')}</td><td>${esc(s.collector || '')}</td><td>${s.line_pay ? 'LINE Pay' : '現金'}</td><td>${esc(s.items || '')}</td><td class="right">${fmt(s.sales_amount)}</td><td class="right">${fmt(s.donation)}</td><td class="right">${fmt(s.total_amount)}</td></tr>`).join('');
       q('summaryRows').innerHTML = out.rows.map(r => `<tr><td>${esc(r.name)}</td><td>${esc(r.style)}</td><td class="right">${fmt(r.sale_qty)}</td><td class="right">${fmt(r.sales_amount)}</td></tr>`).join('');
     }
     renderSaleLines();
