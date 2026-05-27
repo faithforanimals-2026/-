@@ -103,6 +103,12 @@ def setup_db():
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE INDEX IF NOT EXISTS idx_sales_sold_on_id ON sales (sold_on, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_sales_created_at ON sales (created_at);
+            CREATE INDEX IF NOT EXISTS idx_sales_collector ON sales (collector);
+            CREATE INDEX IF NOT EXISTS idx_sale_items_sale_id ON sale_items (sale_id);
+            CREATE INDEX IF NOT EXISTS idx_sale_items_product_style ON sale_items (product_name, product_style);
             """
         )
         count = conn.execute("SELECT COUNT(*) AS count FROM products").fetchone()["count"]
@@ -144,6 +150,73 @@ def require_auth(fn):
 
 def rows_to_json(rows):
     return [{key: float(value) if hasattr(value, "as_tuple") else value for key, value in row.items()} for row in rows]
+
+
+def query_products(conn):
+    rows = conn.execute(
+        """
+        SELECT id, sku, name, style, unit, cost, price, active, 0 AS stock
+        FROM products
+        WHERE active = TRUE
+        ORDER BY name COLLATE "C", style COLLATE "C", sku COLLATE "C"
+        """
+    ).fetchall()
+    return rows_to_json(rows)
+
+
+def query_sales(conn):
+    sale_rows = rows_to_json(
+        conn.execute(
+            """
+            SELECT *
+            FROM sales
+            ORDER BY sold_on DESC, id DESC
+            LIMIT 200
+            """
+        ).fetchall()
+    )
+    if sale_rows:
+        sale_ids = [sale["id"] for sale in sale_rows]
+        placeholders = ", ".join(["%s"] * len(sale_ids))
+        item_rows = rows_to_json(
+            conn.execute(
+                f"""
+                SELECT sale_id, product_name, product_style, qty, unit_price
+                FROM sale_items
+                WHERE sale_id IN ({placeholders})
+                ORDER BY sale_id DESC, id
+                """,
+                tuple(sale_ids),
+            ).fetchall()
+        )
+    else:
+        item_rows = []
+    items_by_sale = {}
+    for item in item_rows:
+        items_by_sale.setdefault(item["sale_id"], []).append(item)
+    for sale in sale_rows:
+        sale["items"] = items_by_sale.get(sale["id"], [])
+    return sale_rows
+
+
+def query_collectors(conn):
+    cleared_at = conn.execute("SELECT value FROM app_settings WHERE key='collectors_cleared_at'").fetchone()
+    params = ()
+    filter_sql = ""
+    if cleared_at:
+        filter_sql = "AND created_at > %s"
+        params = (cleared_at["value"],)
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT collector
+        FROM sales
+        WHERE TRIM(collector) != ''
+        {filter_sql}
+        ORDER BY collector
+        """,
+        params,
+    ).fetchall()
+    return [row["collector"] for row in rows]
 
 
 @app.before_request
@@ -191,19 +264,24 @@ def index():
     return Response(html, mimetype="text/html; charset=utf-8")
 
 
+@app.get("/api/bootstrap")
+@require_auth
+def api_bootstrap():
+    with db() as conn:
+        return jsonify(
+            {
+                "products": query_products(conn),
+                "sales": query_sales(conn),
+                "collectors": query_collectors(conn),
+            }
+        )
+
+
 @app.get("/api/products")
 @require_auth
 def api_products():
     with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, sku, name, style, unit, cost, price, active, 0 AS stock
-            FROM products
-            WHERE active = TRUE
-            ORDER BY name COLLATE "C", style COLLATE "C", sku COLLATE "C"
-            """
-        ).fetchall()
-    return jsonify(rows_to_json(rows))
+        return jsonify(query_products(conn))
 
 
 @app.post("/api/product")
@@ -281,29 +359,7 @@ def api_product_delete():
 @require_auth
 def api_sales():
     with db() as conn:
-        sale_rows = rows_to_json(
-            conn.execute(
-                """
-                SELECT *
-                FROM sales
-                ORDER BY sold_on DESC, id DESC
-                LIMIT 200
-                """
-            ).fetchall()
-        )
-        for sale in sale_rows:
-            sale["items"] = rows_to_json(
-                conn.execute(
-                    """
-                    SELECT product_name, product_style, qty, unit_price
-                    FROM sale_items
-                    WHERE sale_id=%s
-                    ORDER BY id
-                    """,
-                    (sale["id"],),
-                ).fetchall()
-            )
-    return jsonify(sale_rows)
+        return jsonify(query_sales(conn))
 
 
 @app.post("/api/sale")
@@ -391,23 +447,7 @@ def api_sale_delete():
 @require_auth
 def api_collectors():
     with db() as conn:
-        cleared_at = conn.execute("SELECT value FROM app_settings WHERE key='collectors_cleared_at'").fetchone()
-        params = ()
-        filter_sql = ""
-        if cleared_at:
-            filter_sql = "AND created_at > %s"
-            params = (cleared_at["value"],)
-        rows = conn.execute(
-            f"""
-            SELECT DISTINCT collector
-            FROM sales
-            WHERE TRIM(collector) != ''
-            {filter_sql}
-            ORDER BY collector
-            """,
-            params,
-        ).fetchall()
-    return jsonify([row["collector"] for row in rows])
+        return jsonify(query_collectors(conn))
 
 
 @app.post("/api/collectors/clear")
@@ -465,9 +505,38 @@ def daily_summary(day):
             """,
             (day,),
         ).fetchall()
+        sale_details = conn.execute(
+            """
+            SELECT
+                s.id,
+                s.sold_on,
+                s.event_name,
+                s.collector,
+                s.line_pay,
+                s.donation,
+                s.total_amount - s.donation AS sales_amount,
+                s.total_amount,
+                COALESCE(
+                    STRING_AGG(
+                        si.product_name ||
+                        CASE WHEN COALESCE(si.product_style, '') != '' THEN ' / ' || si.product_style ELSE '' END ||
+                        ' x ' || si.qty::text,
+                        '、'
+                        ORDER BY si.id
+                    ),
+                    ''
+                ) AS items
+            FROM sales s
+            LEFT JOIN sale_items si ON si.sale_id = s.id
+            WHERE s.sold_on=%s
+            GROUP BY s.id
+            ORDER BY s.id DESC
+            """,
+            (day,),
+        ).fetchall()
     result = {key: float(value) for key, value in totals.items()}
     result["events"] = "、".join(row["event_name"] for row in event_rows)
-    return {"totals": result, "rows": rows_to_json(rows)}
+    return {"totals": result, "rows": rows_to_json(rows), "sales": rows_to_json(sale_details)}
 
 
 @app.get("/api/summary")
@@ -504,6 +573,22 @@ def export_summary():
     writer.writerow(["商品名稱", "款式", "售出數量", "銷售金額"])
     for row in summary["rows"]:
         writer.writerow([row["name"], row["style"], row["sale_qty"], row["sales_amount"]])
+    writer.writerow([])
+    writer.writerow(["收款明細"])
+    writer.writerow(["日期", "活動名稱", "收款人", "付款方式", "內容", "商品總價", "捐款金額", "總金額"])
+    for sale in summary["sales"]:
+        writer.writerow(
+            [
+                sale["sold_on"],
+                sale["event_name"],
+                sale["collector"],
+                "LINE Pay" if sale["line_pay"] else "現金",
+                sale["items"],
+                sale["sales_amount"],
+                sale["donation"],
+                sale["total_amount"],
+            ]
+        )
     return Response(
         out.getvalue().encode("utf-8-sig"),
         mimetype="text/csv; charset=utf-8",
